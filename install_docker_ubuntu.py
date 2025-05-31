@@ -19,36 +19,66 @@ def log_info(message):
 def log_error(message):
     print(f"[ERROR] {time.strftime('%Y-%m-%d %H:%M:%S')} - {message}", file=sys.stderr)
 
-def run_command(command, shell=False, check=True, capture_output=False, text=True, cwd=None, env=None, input_data=None):
-    """Helper function to run a shell command."""
+def run_command(command, shell=False, check=True, capture_output=False, text=True, cwd=None, env=None, input_string=None, input_stream=None):
+    """
+    Helper function to run a shell command.
+
+    Allows for providing input via a string (`input_string`) or a stream (`input_stream`).
+    """
     log_info(f"Executing: {' '.join(command) if isinstance(command, list) else command}")
+
+    stdin_source = None
+    if input_stream:
+        stdin_source = input_stream
+    elif input_string is not None: # Ensure empty string can be passed as input
+        stdin_source = subprocess.PIPE # subprocess.run expects PIPE if input arg is used
+
     try:
         process = subprocess.run(
             command,
             shell=shell,
             check=check,
             capture_output=capture_output,
-            text=text,
+            text=text, # text=True implies decoding stdin/stdout/stderr as text.
             cwd=cwd,
             env=env,
-            input=input_data
+            input=input_string if input_string is not None else None, # Pass input_string if provided
+            stdin=stdin_source
         )
-        if capture_output:
-            return process
-        return True
+        # If capture_output is True, process.stdout and process.stderr are captured.
+        # If input_stream was used, it's already consumed by the process.
+        # Logging of stdout/stderr in case of error is handled by CalledProcessError block.
+        if process.stdout and capture_output: # Log stdout if captured
+            log_info(f"STDOUT:\n{process.stdout.strip()}")
+        if process.stderr and capture_output: # Log stderr if captured (even if check=True and no error)
+             # This might be verbose for successful commands that write to stderr (e.g. progress)
+             # but good for debugging. Consider if this should only be for check=False or errors.
+            log_info(f"STDERR:\n{process.stderr.strip()}")
+
+        return process if capture_output else (process.returncode == 0)
     except subprocess.CalledProcessError as e:
         log_error(f"Command failed: {e}")
-        if e.stdout:
+        if e.stdout: # Already decoded due to text=True
             log_error(f"STDOUT: {e.stdout.strip()}")
-        if e.stderr:
+        if e.stderr: # Already decoded
             log_error(f"STDERR: {e.stderr.strip()}")
-        if check: # If check is True, CalledProcessError is raised, and we exit here.
-             sys.exit(1)
-        return False # If check is False, we return False on error
+        # No need to sys.exit(1) here if check=True, as it's already raised.
+        # The original 'if check: sys.exit(1)' was redundant due to check=True behavior.
+        # If check is False, we fall through and return based on success.
+        if not check: # Only return False if check is False, otherwise error is raised.
+            return False
+        # If check is True, this part is not reached due to exception.
+        # For safety, ensure a clear path for check=True failure, though exception is primary.
+        raise
     except FileNotFoundError:
         log_error(f"Command not found: {command[0] if isinstance(command, list) else command.split()[0]}")
         if check:
-            sys.exit(1)
+            raise # Re-raise the exception if check is True
+        return False
+    except Exception as e: # Catch any other unexpected errors
+        log_error(f"An unexpected error occurred: {e}")
+        if check:
+            raise
         return False
 
 
@@ -118,36 +148,92 @@ def main():
     # Remove any existing key to ensure a clean state
     if os.path.exists(gpg_key_path):
         os.remove(gpg_key_path)
-        log_info(f"Removed existing GPG key at {gpg_key_path}")
+        log_info(f"Removed existing Docker GPG key at {gpg_key_path}.")
+    else:
+        log_info(f"No existing Docker GPG key found at {gpg_key_path}. Proceeding to download.")
 
-    # Using shell=True for the pipe, ensure the command is safe
-    gpg_command = f"curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o {gpg_key_path}"
-    if not run_command(gpg_command, shell=True): # shell=True for the pipe
-        log_error("Failed to download and dearmor Docker GPG key.")
+    log_info("Downloading Docker's GPG key...")
+    curl_result = run_command(
+        ["curl", "-fsSL", "https://download.docker.com/linux/ubuntu/gpg"],
+        capture_output=True,
+        text=False,  # GPG key is binary
+        check=True # Exit if curl fails
+    )
+    if not (curl_result and curl_result.stdout):
+        log_error("Failed to download Docker's GPG key (curl command output was empty).")
+        sys.exit(1)
+
+    log_info(f"Dearmoring Docker's GPG key to {gpg_key_path}...")
+    # Pass the binary stdout from curl to gpg's stdin.
+    # `run_command` for gpg will receive bytes via input_stream and pass to stdin=input_stream.
+    # gpg --dearmor expects binary input.
+    # The `text=True` default in run_command is for decoding output, not for stdin handling here.
+    # We explicitly pass `curl_result.stdout` (bytes) to `input_stream`.
+    # `subprocess.run` will handle this correctly. If gpg needs text, it would fail.
+    # It's better to let `gpg` handle the input as a stream of bytes.
+    if not run_command(
+        ["gpg", "--dearmor", "-o", gpg_key_path],
+        input_stream=curl_result.stdout, # stdout is bytes due to text=False in curl command
+        check=True, # Exit if gpg fails
+        capture_output=True # To log any potential stderr from gpg
+    ):
+        # log_error is already called by run_command on failure with check=True,
+        # but we might want a more specific message before sys.exit if run_command didn't exit.
+        # However, with check=True, run_command *will* raise an exception, so this path isn't taken.
+        # The log_error in run_command itself will be the primary error message.
+        log_error("Failed to dearmor Docker's GPG key using the gpg command.") # This is more of a fallback.
         sys.exit(1)
     
     if not os.path.exists(gpg_key_path):
-        log_error(f"Docker GPG key not found at {gpg_key_path} after download attempt.")
+        log_error(f"Docker GPG key file not found at {gpg_key_path} after dearmoring attempt.")
         sys.exit(1)
+
+    log_info(f"Setting read permissions for Docker GPG key at {gpg_key_path}...")
     run_command(["chmod", "a+r", gpg_key_path])
 
-    log_info("Setting up Docker's apt repository...")
+    log_info("Configuring Docker's APT repository...")
     arch = get_architecture()
+    # current_codename is used here, which is correct as it's been validated or confirmed by the user.
     repo_content = (
         f"deb [arch={arch} signed-by={gpg_key_path}] "
         f"https://download.docker.com/linux/ubuntu {current_codename} stable\n"
     )
     docker_list_file = "/etc/apt/sources.list.d/docker.list"
+
+    # Idempotency check for Docker repository configuration
+    write_repo_file = True
+    if os.path.exists(docker_list_file):
+        try:
+            with open(docker_list_file, "r") as f:
+                existing_content = f.read()
+            # Normalize both new and existing content for comparison
+            # Stripping whitespace handles potential differences in trailing newlines etc.
+            if existing_content.strip() == repo_content.strip():
+                log_info(f"Docker APT repository at {docker_list_file} is already configured correctly.")
+                write_repo_file = False
+            else:
+                log_info(f"Docker APT repository at {docker_list_file} exists but content differs. Overwriting...")
+        except IOError as e:
+            log_warning(f"Could not read existing Docker APT repository file at {docker_list_file}: {e}. Proceeding to write/overwrite.")
     
-    # Write the repo file using tee via shell to handle permissions
-    echo_tee_command = f"echo '{repo_content}' | tee {docker_list_file} > /dev/null"
-    if not run_command(echo_tee_command, shell=True):
-        log_error(f"Failed to write Docker repository list to {docker_list_file}")
-        sys.exit(1)
+    if write_repo_file:
+        log_info(f"Writing Docker APT repository configuration to {docker_list_file}...")
+        try:
+            with open(docker_list_file, "w") as f:
+                f.write(repo_content)
+            log_info(f"Successfully wrote Docker APT repository configuration to {docker_list_file}.")
+        except IOError as e:
+            log_error(f"Failed to write Docker APT repository configuration to {docker_list_file}: {e}")
+            sys.exit(1)
+    else:
+        # This case is when the file exists and content matches.
+        # The "apt-get update" is still important even if we didn't write the file this time,
+        # as other sources might have changed or it's the first run.
+        pass
 
 
     # 4. Install Docker Engine
-    log_info("Updating apt package index after adding Docker repository...")
+    log_info("Updating apt package index after adding Docker repository (if changed or first time)...")
     run_command(["apt-get", "update"])
 
     log_info("Installing Docker Engine, CLI, containerd, and Docker Compose plugin...")
@@ -173,45 +259,63 @@ def main():
 
     # 5. Verify installation (optional)
     if VERIFY_INSTALLATION:
-        log_info("Verifying Docker installation by running the hello-world container...")
+        log_info("Verifying Docker installation by running the 'hello-world' container...")
         # Run with check=False to evaluate success manually
-        if run_command(["docker", "run", "hello-world"], check=False):
-            log_info("Docker hello-world container ran successfully.")
+        verify_result = run_command(["docker", "run", "hello-world"], check=False, capture_output=True)
+        if verify_result and verify_result.returncode == 0:
+            # run_command already logs stdout for hello-world if capture_output=True
+            log_info("Docker 'hello-world' container ran successfully.")
         else:
-            log_error("Failed to run Docker hello-world container. The installation might have issues.")
-            # Not exiting here, as core installation might be okay.
+            log_error("Failed to run Docker 'hello-world' container. The installation might have issues.")
+            # verify_result.stderr is logged by run_command if capture_output=True
+            # Adding an extra log here might be redundant if run_command's logging is sufficient.
+            # if verify_result and verify_result.stderr:
+            #      log_error(f"Hello-world STDERR: {verify_result.stderr.strip()}")
+    else:
+        log_info("Skipping Docker installation verification (hello-world container).")
 
     # 6. Post-installation steps: Manage Docker as a non-root user (optional)
     if ADD_USER_TO_DOCKER_GROUP:
+        log_info("Attempting to configure Docker for non-root user access...")
         sudo_user = os.getenv("SUDO_USER")
         if sudo_user:
-            log_info(f"Attempting to add user '{sudo_user}' to the 'docker' group...")
-            # Check if group exists, create if not
-            group_check_result = run_command(["getent", "group", "docker"], check=False, capture_output=True)
-            if group_check_result.returncode != 0:
-                log_info("Docker group does not exist. Creating it...")
-                if not run_command(["groupadd", "docker"]):
-                    log_error("Failed to create 'docker' group.")
+            log_info(f"Checking if user '{sudo_user}' needs to be added to the 'docker' group.")
+            # Check if group exists
+            group_exists_result = run_command(["getent", "group", "docker"], check=False, capture_output=True)
+            if group_exists_result.returncode != 0:
+                log_info("Docker group does not exist. Creating 'docker' group...")
+                if run_command(["groupadd", "docker"], check=False):
+                    log_info("'docker' group created successfully.")
                 else:
-                    log_info("'docker' group created.")
+                    log_error("Failed to create 'docker' group. User management may fail.")
+            else:
+                log_info("'docker' group already exists.")
             
-            # Add user to group
-            if run_command(["usermod", "-aG", "docker", sudo_user]):
-                log_info(f"User '{sudo_user}' added to the 'docker' group.")
+            # Add user to group if not already a member
+            # Checking membership is a bit more complex with `getent group docker` or `groups $USER`
+            # For simplicity, usermod -aG is idempotent in effect (won't add if already there, won't error).
+            log_info(f"Adding user '{sudo_user}' to the 'docker' group (if not already a member)...")
+            if run_command(["usermod", "-aG", "docker", sudo_user], check=False):
+                log_info(f"User '{sudo_user}' successfully added to the 'docker' group.")
                 log_info(f"IMPORTANT: '{sudo_user}' needs to log out and log back in, or reboot, for this group change to take effect.")
             else:
-                log_error(f"Failed to add user '{sudo_user}' to 'docker' group.")
+                log_error(f"Failed to add user '{sudo_user}' to the 'docker' group.")
         else:
-            log_info("SUDO_USER variable is not set. Cannot automatically add user to 'docker' group.")
-            log_info("If you want to run Docker as a non-root user, run the following commands manually:")
-            log_info("  sudo groupadd docker  (if it doesn't exist)")
-            log_info("  sudo usermod -aG docker YOUR_USERNAME")
-            log_info("Then, log out and log back in, or reboot.")
+            log_warning("SUDO_USER environment variable not found. Cannot automatically add user to 'docker' group.")
+            log_info("To run Docker as a non-root user, please perform the following steps manually:")
+            log_info("  1. Create the 'docker' group (if it doesn't exist): sudo groupadd docker")
+            log_info("  2. Add your user to the 'docker' group: sudo usermod -aG docker YOUR_USERNAME")
+            log_info("  3. Log out and log back in, or reboot, for the changes to take effect.")
+    else:
+        log_info("Skipping non-root user configuration for Docker.")
 
-    log_info("Docker installation and basic configuration completed.")
-    log_info("Docker service should be started and enabled by default.")
+    log_info("Docker installation script finished.")
+    log_info("Docker service should be started and enabled by default on systemd systems.")
     log_info("You can check status with: systemctl status docker")
     log_info("If not enabled/started, use: sudo systemctl enable --now docker")
+
+def log_warning(message):
+    print(f"[WARNING] {time.strftime('%Y-%m-%d %H:%M:%S')} - {message}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
