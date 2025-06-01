@@ -6,6 +6,7 @@ import os
 import sys
 import shutil
 import time
+import io
 
 # --- Configuration ---
 VERIFY_INSTALLATION = True
@@ -173,7 +174,7 @@ def main():
     # It's better to let `gpg` handle the input as a stream of bytes.
     if not run_command(
         ["gpg", "--dearmor", "-o", gpg_key_path],
-        input_stream=curl_result.stdout, # stdout is bytes due to text=False in curl command
+        input_stream=io.BytesIO(curl_result.stdout), # Wrap bytes in BytesIO for file-like object
         check=True, # Exit if gpg fails
         capture_output=True # To log any potential stderr from gpg
     ):
