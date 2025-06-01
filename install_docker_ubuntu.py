@@ -6,7 +6,6 @@ import os
 import sys
 import shutil
 import time
-import io
 
 # --- Configuration ---
 VERIFY_INSTALLATION = True
@@ -20,19 +19,18 @@ def log_info(message):
 def log_error(message):
     print(f"[ERROR] {time.strftime('%Y-%m-%d %H:%M:%S')} - {message}", file=sys.stderr)
 
-def run_command(command, shell=False, check=True, capture_output=False, text=True, cwd=None, env=None, input_string=None, input_stream=None):
+def run_command(command, shell=False, check=True, capture_output=False, text=True, cwd=None, env=None, input_string=None):
     """
     Helper function to run a shell command.
 
-    Allows for providing input via a string (`input_string`) or a stream (`input_stream`).
+    Allows for providing input via `input_string` (can be str or bytes).
+    If `input_string` is bytes, `text` should typically be False.
     """
     log_info(f"Executing: {' '.join(command) if isinstance(command, list) else command}")
 
-    stdin_source = None
-    if input_stream:
-        stdin_source = input_stream
-    elif input_string is not None: # Ensure empty string can be passed as input
-        stdin_source = subprocess.PIPE # subprocess.run expects PIPE if input arg is used
+    stdin_for_subprocess = None
+    if input_string is not None:
+        stdin_for_subprocess = subprocess.PIPE
 
     try:
         process = subprocess.run(
@@ -40,21 +38,24 @@ def run_command(command, shell=False, check=True, capture_output=False, text=Tru
             shell=shell,
             check=check,
             capture_output=capture_output,
-            text=text, # text=True implies decoding stdin/stdout/stderr as text.
+            text=text, # If True, decodes stdin/stdout/stderr as text. If False, they are bytes.
             cwd=cwd,
             env=env,
-            input=input_string if input_string is not None else None, # Pass input_string if provided
-            stdin=stdin_source
+            input=input_string,
+            stdin=stdin_for_subprocess
         )
-        # If capture_output is True, process.stdout and process.stderr are captured.
-        # If input_stream was used, it's already consumed by the process.
-        # Logging of stdout/stderr in case of error is handled by CalledProcessError block.
-        if process.stdout and capture_output: # Log stdout if captured
-            log_info(f"STDOUT:\n{process.stdout.strip()}")
-        if process.stderr and capture_output: # Log stderr if captured (even if check=True and no error)
-             # This might be verbose for successful commands that write to stderr (e.g. progress)
-             # but good for debugging. Consider if this should only be for check=False or errors.
-            log_info(f"STDERR:\n{process.stderr.strip()}")
+        # Logging of stdout/stderr if captured
+        # Note: if text=False, process.stdout/stderr are bytes and strip() might fail if they are None.
+        # If text=True, they are strings.
+        if capture_output:
+            if process.stdout:
+                output_stdout = process.stdout.strip() if text else process.stdout.decode(errors='replace').strip()
+                if output_stdout: # Only log if there's actual output after stripping
+                    log_info(f"STDOUT:\n{output_stdout}")
+            if process.stderr:
+                output_stderr = process.stderr.strip() if text else process.stderr.decode(errors='replace').strip()
+                if output_stderr: # Only log if there's actual output after stripping
+                    log_info(f"STDERR:\n{output_stderr}")
 
         return process if capture_output else (process.returncode == 0)
     except subprocess.CalledProcessError as e:
@@ -172,11 +173,13 @@ def main():
     # We explicitly pass `curl_result.stdout` (bytes) to `input_stream`.
     # `subprocess.run` will handle this correctly. If gpg needs text, it would fail.
     # It's better to let `gpg` handle the input as a stream of bytes.
+    # Therefore, when calling run_command with bytes in input_string, text must be False.
     if not run_command(
         ["gpg", "--dearmor", "-o", gpg_key_path],
-        input_stream=io.BytesIO(curl_result.stdout), # Wrap bytes in BytesIO for file-like object
+        input_string=curl_result.stdout, # stdout from curl is bytes (text=False in that call)
+        text=False, # Crucial: input_string is bytes, so subprocess should handle it as bytes
         check=True, # Exit if gpg fails
-        capture_output=True # To log any potential stderr from gpg
+        capture_output=True # To log any potential stderr from gpg (will be decoded for logging)
     ):
         # log_error is already called by run_command on failure with check=True,
         # but we might want a more specific message before sys.exit if run_command didn't exit.
