@@ -25,12 +25,16 @@ def run_command(command, shell=False, check=True, capture_output=False, text=Tru
 
     Allows for providing input via `input_string` (can be str or bytes).
     If `input_string` is bytes, `text` should typically be False.
+    When `input_string` is provided, `stdin` is set to `subprocess.PIPE`.
     """
     log_info(f"Executing: {' '.join(command) if isinstance(command, list) else command}")
 
-    stdin_for_subprocess = None
+    final_stdin_arg = None
+    final_input_arg = None
+
     if input_string is not None:
-        stdin_for_subprocess = subprocess.PIPE
+        final_stdin_arg = subprocess.PIPE
+        final_input_arg = input_string
 
     try:
         process = subprocess.run(
@@ -41,8 +45,8 @@ def run_command(command, shell=False, check=True, capture_output=False, text=Tru
             text=text, # If True, decodes stdin/stdout/stderr as text. If False, they are bytes.
             cwd=cwd,
             env=env,
-            input=input_string,
-            stdin=stdin_for_subprocess
+            input=final_input_arg,
+            stdin=final_stdin_arg
         )
         # Logging of stdout/stderr if captured
         # Note: if text=False, process.stdout/stderr are bytes and strip() might fail if they are None.
