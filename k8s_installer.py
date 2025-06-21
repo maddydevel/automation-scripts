@@ -216,7 +216,22 @@ def run_remote_command(server_ip, username, command, pty=False, hide=False, time
     """
     if not hide:
         print_info(f"Executing on {username}@{server_ip}: {command}")
-    ssh_client = None
+
+    adjusted_command = command
+    if command.strip().startswith("sudo "):
+        parts = command.strip().split(" ", 1)
+        # Correctly handle "sudo command" vs "sudo -u user command"
+        if parts[0] == "sudo" and len(parts) > 1:
+             # Insert -n after sudo but before other options or the command
+            adjusted_command = f"sudo -n {parts[1]}"
+        elif parts[0] == "sudo" and len(parts) == 1: # e.g. just "sudo" - unlikely but handle
+            adjusted_command = "sudo -n"
+        # If sudo is not the first part (e.g. "VAR=val sudo foo"), this simple logic won't adjust it.
+        # For this script, commands are simple "sudo actual_command..."
+
+        if not hide and adjusted_command != command:
+            print_info(f"Adjusted sudo command for non-interactive: {adjusted_command}")
+
     ssh_client = None
     try:
         ssh_client = paramiko.SSHClient()
@@ -278,7 +293,9 @@ def execute_remote_commands(server_ip, username, commands_to_run, step_name):
         try:
             # Add a more specific timeout for apt commands if needed, otherwise use default.
             cmd_timeout = 600 if "apt-get" in cmd or "apt " in cmd else 300
-            run_remote_command(server_ip, username, cmd, timeout=cmd_timeout)
+            # Always request a PTY for commands run through execute_remote_commands,
+            # as many involve sudo and might interact better with a PTY.
+            run_remote_command(server_ip, username, cmd, pty=True, timeout=cmd_timeout)
         except (subprocess.CalledProcessError, ConnectionError, TimeoutError, Exception) as e:
             print_error(f"Failed command {i+1}/{len(commands_to_run)} ('{cmd[:60]}...') in step '{step_name}' on {server_ip}.")
             # Error already printed by run_remote_command or its callers
