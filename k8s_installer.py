@@ -291,7 +291,7 @@ def common_prerequisites(server_ip, username):
     """Disables swap, configures kernel modules and sysctl settings."""
     commands = [
         "sudo swapoff -a",
-        "sudo sed -i '/ swap / s/^\(.*\)$/#\\1/g' /etc/fstab", # Persist swap off
+        r"sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab", # Persist swap off, raw string
         "cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf\noverlay\nbr_netfilter\nEOF",
         "sudo modprobe overlay",
         "sudo modprobe br_netfilter",
